@@ -119,7 +119,7 @@ def get_client():
         api_key=AZURE_KEY,
         azure_endpoint=AZURE_ENDPOINT,
         api_version=AZURE_VERSION,
-        timeout=30.0,
+        timeout=60.0,
         max_retries=2,
     )
 
@@ -187,15 +187,26 @@ def _build_messages(config, history, user_input=None, action="start"):
     return messages
 
 
+# Max history segments to send to Azure (prevents token overflow on long stories)
+_MAX_HISTORY_SEGMENTS = 12
+
+
 def _stream_response(slot, config, history, user_input=None, action="start"):
     """Stream Azure response tokens into `slot` (st.empty()), keeping the WebSocket alive.
     Returns (narrative, choices, is_complete) after streaming completes."""
     client = get_client()
-    messages = _build_messages(config, history, user_input, action)
+    # Trim history to last N segments so Azure doesn't choke on long stories
+    trimmed_history = history[-_MAX_HISTORY_SEGMENTS:] if len(history) > _MAX_HISTORY_SEGMENTS else history
+    messages = _build_messages(config, trimmed_history, user_input, action)
+    slot.markdown(
+        '<div class="narrative-block" style="white-space:pre-wrap;opacity:0.6">'
+        '<span class="typing-dots"><span></span><span></span><span></span></span> Weaving the story...</div>',
+        unsafe_allow_html=True,
+    )
     stream = client.chat.completions.create(
         model=AZURE_DEPLOYMENT,
         messages=messages,
-        max_completion_tokens=1000,
+        max_completion_tokens=1200,
         stream=True,
     )
     full_text = ""
@@ -248,11 +259,12 @@ Role must be one of: Hero / Protagonist, Mentor / Guide, Sidekick / Companion, V
 def call_azure(config, history, user_input=None, action="start"):
     """Blocking call kept for backwards-compat; prefer _stream_response for live UI."""
     client = get_client()
-    messages = _build_messages(config, history, user_input, action)
+    trimmed_history = history[-_MAX_HISTORY_SEGMENTS:] if len(history) > _MAX_HISTORY_SEGMENTS else history
+    messages = _build_messages(config, trimmed_history, user_input, action)
     resp = client.chat.completions.create(
         model=AZURE_DEPLOYMENT,
         messages=messages,
-        max_completion_tokens=1000,
+        max_completion_tokens=1200,
     )
     return parse_response(resp.choices[0].message.content or "")
 
