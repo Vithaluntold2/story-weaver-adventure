@@ -32,10 +32,17 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+.streamlit/secrets.toml
 
 # vercel
 .vercel
 
 # typescript
 *.tsbuildinfo
-next-env.d.ts
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv*/
+*.egg-info/
