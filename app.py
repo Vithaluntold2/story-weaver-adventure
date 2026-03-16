@@ -1,5 +1,6 @@
 import streamlit as st
 from openai import AzureOpenAI
+import os
 import json
 import re
 import io
@@ -92,17 +93,34 @@ CHARACTER_ROLES = [
 
 # azure openai setup
 
-AZURE_ENDPOINT = st.secrets.get("AZURE_OPENAI_ENDPOINT", "")
-AZURE_KEY = st.secrets.get("AZURE_OPENAI_API_KEY", "")
-AZURE_VERSION = st.secrets.get("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
-AZURE_DEPLOYMENT = st.secrets.get("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5.2-chat")
+
+def _get_setting(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        value = ""
+    if not value:
+        value = os.environ.get(name, default)
+    return value
+
+
+AZURE_ENDPOINT = _get_setting("AZURE_OPENAI_ENDPOINT", "")
+AZURE_KEY = _get_setting("AZURE_OPENAI_API_KEY", "")
+AZURE_VERSION = _get_setting("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+AZURE_DEPLOYMENT = _get_setting("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5.2-chat")
 
 
 def get_client():
+    if not AZURE_KEY or not AZURE_ENDPOINT:
+        raise ValueError(
+            "Azure OpenAI credentials not configured. Provide AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT via Streamlit secrets or environment variables."
+        )
     return AzureOpenAI(
         api_key=AZURE_KEY,
         azure_endpoint=AZURE_ENDPOINT,
         api_version=AZURE_VERSION,
+        timeout=30.0,
+        max_retries=2,
     )
 
 
@@ -151,10 +169,8 @@ def parse_response(text):
     return narrative, choices, is_complete
 
 
-def call_azure(config, history, user_input=None, action="start"):
-    client = get_client()
+def _build_messages(config, history, user_input=None, action="start"):
     messages = [{"role": "system", "content": build_system_prompt(config)}]
-
     if action == "start":
         messages.append({
             "role": "user",
@@ -168,7 +184,71 @@ def call_azure(config, history, user_input=None, action="start"):
                 "role": "user",
                 "content": f'The reader chose: "{user_input}". Continue the story based on this decision. Write the next part of the narrative and provide 3 new choices.',
             })
+    return messages
 
+
+def _stream_response(slot, config, history, user_input=None, action="start"):
+    """Stream Azure response tokens into `slot` (st.empty()), keeping the WebSocket alive.
+    Returns (narrative, choices, is_complete) after streaming completes."""
+    client = get_client()
+    messages = _build_messages(config, history, user_input, action)
+    stream = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT,
+        messages=messages,
+        max_completion_tokens=1000,
+        stream=True,
+    )
+    full_text = ""
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            full_text += chunk.choices[0].delta.content
+            slot.markdown(
+                f'<div class="narrative-block" style="white-space:pre-wrap">{full_text}&#9646;</div>',
+                unsafe_allow_html=True,
+            )
+    slot.empty()
+    return parse_response(full_text)
+
+
+def generate_ai_config(prompt: str) -> dict | None:
+    """Ask Azure to generate a complete story config JSON from a user prompt."""
+    try:
+        client = get_client()
+        system_msg = (
+            "You are a creative story architect. Given a story idea, return ONLY a valid JSON object — "
+            "no markdown fences, no extra text, no explanation."
+        )
+        user_msg = f"""Generate a complete interactive story configuration based on this idea: \"{prompt}\"
+
+Return a JSON object with exactly these fields:
+{{
+  "theme": "<one of: Fantasy, Science Fiction, Mystery, Adventure, Horror, Romance>",
+  "subgenre": "<specific subgenre string>",
+  "setting": "<vivid 2-3 sentence setting description>",
+  "tone": "<one of: Epic & Grand, Lighthearted & Fun, Dark & Gritty, Mysterious & Suspenseful, Whimsical & Playful, Dramatic & Intense>",
+  "characters": [
+    {{"name": "...", "role": "<role>", "personality": "...", "background": "..."}},
+    {{"name": "...", "role": "<role>", "personality": "...", "background": "..."}}
+  ]
+}}
+Role must be one of: Hero / Protagonist, Mentor / Guide, Sidekick / Companion, Villain / Antagonist, Mysterious Stranger, Love Interest"""
+        resp = client.chat.completions.create(
+            model=AZURE_DEPLOYMENT,
+            messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+            max_completion_tokens=800,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def call_azure(config, history, user_input=None, action="start"):
+    """Blocking call kept for backwards-compat; prefer _stream_response for live UI."""
+    client = get_client()
+    messages = _build_messages(config, history, user_input, action)
     resp = client.chat.completions.create(
         model=AZURE_DEPLOYMENT,
         messages=messages,
@@ -179,7 +259,7 @@ def call_azure(config, history, user_input=None, action="start"):
 
 def init_state():
     defaults = {
-        "phase": "welcome",      # welcome | setup | playing | complete
+        "phase": "welcome",      # welcome | setup | ai_setup | playing | complete
         "setup_step": 0,         # 0-5
         "theme_id": "",
         "subgenre": "",
@@ -191,6 +271,8 @@ def init_state():
         "turn_count": 0,
         "is_complete": False,
         "error": None,
+        "color_mode": "dark",     # dark | light | system
+        "ai_setup_prompt": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -393,8 +475,88 @@ CUSTOM_CSS = """
 </style>
 """
 
+_LIGHT_CSS_OVERRIDE = """
+<style>
+    body, .stApp, [data-testid="stAppViewContainer"], [data-testid="block-container"] {
+        background-color: #faf7f0 !important;
+        color: #1a1a2e !important;
+    }
+    .narrative-block {
+        color: #2a2a3e;
+        background: rgba(255, 252, 240, 0.95);
+        border-left-color: #c49b30;
+    }
+    .sw-card {
+        background: rgba(255, 252, 242, 0.95);
+        border-color: rgba(160, 120, 30, 0.2);
+    }
+    .sw-card:hover { border-color: rgba(160, 120, 30, 0.5); }
+    .sw-card-selected {
+        border-color: #c49b30 !important;
+        background: rgba(212, 163, 55, 0.12) !important;
+    }
+    .user-choice-bubble {
+        background: rgba(212, 163, 55, 0.13);
+        border-color: rgba(160, 120, 30, 0.3);
+        color: #6a4f10;
+    }
+    .welcome-hero .tagline { color: #444; }
+    .welcome-hero .subtitle { color: #666; }
+    .section-desc, .sw-header-sub, .feature-item { color: #666; }
+    .sw-header { border-bottom-color: rgba(0,0,0,0.1); }
+    .end-banner h2 { color: #2a2a3e; }
+    [data-testid="stSidebar"] { background: #f0ebdf !important; }
+    div.stButton > button { color: #1a1a2e; }
+</style>
+"""
+
+_SYSTEM_CSS_ADDON = """
+<style>
+    @media (prefers-color-scheme: light) {
+        body, .stApp, [data-testid="stAppViewContainer"], [data-testid="block-container"] {
+            background-color: #faf7f0 !important;
+            color: #1a1a2e !important;
+        }
+        .narrative-block {
+            color: #2a2a3e;
+            background: rgba(255, 252, 240, 0.95);
+            border-left-color: #c49b30;
+        }
+        .sw-card {
+            background: rgba(255, 252, 242, 0.95);
+            border-color: rgba(160, 120, 30, 0.2);
+        }
+        .sw-card:hover { border-color: rgba(160, 120, 30, 0.5); }
+        .sw-card-selected {
+            border-color: #c49b30 !important;
+            background: rgba(212, 163, 55, 0.12) !important;
+        }
+        .user-choice-bubble {
+            background: rgba(212, 163, 55, 0.13);
+            border-color: rgba(160, 120, 30, 0.3);
+            color: #6a4f10;
+        }
+        .section-desc, .sw-header-sub, .feature-item { color: #666; }
+        .sw-header { border-bottom-color: rgba(0,0,0,0.1); }
+        .end-banner h2 { color: #2a2a3e; }
+        [data-testid="stSidebar"] { background: #f0ebdf !important; }
+        div.stButton > button { color: #1a1a2e; }
+    }
+</style>
+"""
+
+
+def get_css(mode: str = "dark") -> str:
+    """Return the full CSS string for the given display mode."""
+    if mode == "light":
+        return CUSTOM_CSS + _LIGHT_CSS_OVERRIDE
+    if mode == "system":
+        return CUSTOM_CSS + _SYSTEM_CSS_ADDON
+    return CUSTOM_CSS
+
 def render_welcome():
-    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+    mode = st.session_state.get("color_mode", "dark")
+    st.markdown(get_css(mode), unsafe_allow_html=True)
     st.markdown(f"""
     <div class="welcome-hero">
         <div style="margin-bottom:16px">{lucide("book-open", 56, "#d4a337")}</div>
@@ -406,8 +568,12 @@ def render_welcome():
 
     col1, col2, col3 = st.columns([1, 1.2, 1])
     with col2:
-        if st.button("Begin Your Adventure  →", key="start_btn", type="primary", use_container_width=True):
+        if st.button("Begin Your Adventure  \u2192", key="start_btn", type="primary", use_container_width=True):
             st.session_state.phase = "setup"
+            st.rerun()
+        st.markdown('<div style="text-align:center;color:#555;font-size:12px;margin:6px 0 4px">\u2014 or \u2014</div>', unsafe_allow_html=True)
+        if st.button("\u2728 Let AI Build My Story", key="ai_btn", use_container_width=True):
+            st.session_state.phase = "ai_setup"
             st.rerun()
 
     st.markdown(f"""
@@ -419,8 +585,60 @@ def render_welcome():
     """, unsafe_allow_html=True)
 
 
+def render_ai_setup():
+    mode = st.session_state.get("color_mode", "dark")
+    st.markdown(get_css(mode), unsafe_allow_html=True)
+    st.markdown(f'<div class="section-title">{icon_html("sparkles", 20)} AI Story Architect</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-desc">Describe your story idea in a sentence or two — or leave it blank and let AI fully surprise you.</div>', unsafe_allow_html=True)
+
+    prompt = st.text_area(
+        "Story idea",
+        value=st.session_state.get("ai_setup_prompt", ""),
+        placeholder='e.g., "A cyberpunk detective in a rain-soaked city investigates a murder involving stolen memories..."',
+        height=110,
+        label_visibility="collapsed",
+    )
+    st.session_state.ai_setup_prompt = prompt
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("\u2190 Back", key="ai_back"):
+            st.session_state.phase = "welcome"
+            st.rerun()
+    with col2:
+        btn_label = "\u2728 Generate My Story" if prompt.strip() else "\U0001f3b2 Fully Surprise Me"
+        if st.button(btn_label, key="ai_generate", type="primary", use_container_width=True):
+            final_prompt = prompt.strip() or "surprise me with something completely unexpected and creative"
+            with st.spinner("AI is designing your story world\u2026"):
+                config_dict = generate_ai_config(final_prompt)
+            if config_dict:
+                theme_name_to_id = {t["name"]: t["id"] for t in THEMES}
+                st.session_state.theme_id = theme_name_to_id.get(config_dict.get("theme", ""), THEMES[0]["id"])
+                st.session_state.subgenre = config_dict.get("subgenre", "")
+                st.session_state.setting = config_dict.get("setting", "")
+                tone_name_to_id = {t["name"]: t["id"] for t in TONES}
+                st.session_state.tone_id = tone_name_to_id.get(config_dict.get("tone", ""), TONES[0]["id"])
+                raw_chars = config_dict.get("characters", [])
+                st.session_state.characters = [
+                    {
+                        "name": c.get("name", ""),
+                        "role": c.get("role", CHARACTER_ROLES[0]),
+                        "personality": c.get("personality", ""),
+                        "background": c.get("background", ""),
+                    }
+                    for c in raw_chars
+                ] or [{"name": "", "personality": "", "background": "", "role": CHARACTER_ROLES[0]}]
+                # Show the AI-generated config before starting
+                st.session_state.phase = "setup"
+                st.session_state.setup_step = 5
+                st.rerun()
+            else:
+                st.error("AI couldn\u2019t generate a configuration. Try a different prompt, or switch to manual setup.")
+
+
 def render_setup():
-    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+    mode = st.session_state.get("color_mode", "dark")
+    st.markdown(get_css(mode), unsafe_allow_html=True)
     step = st.session_state.setup_step
     total = 6
     pct = int(((step + 1) / total) * 100)
@@ -615,16 +833,23 @@ def launch_story():
     st.session_state.turn_count = 0
     st.session_state.segments = []
     st.session_state.is_complete = False
+    st.session_state.error = None
 
-    with st.spinner("The story begins..."):
-        narrative, choices, is_complete = call_azure(config, [], action="start")
+    slot = st.empty()
+    try:
+        narrative, choices, is_complete = _stream_response(slot, config, [], action="start")
+    except Exception as e:
+        st.session_state.error = f"Azure OpenAI error while starting the story: {type(e).__name__}: {e}"
+        st.session_state.phase = "setup"
+        return
     st.session_state.segments.append({"narrator": "ai", "text": narrative, "choices": choices, "ts": datetime.now().isoformat()})
     st.session_state.turn_count = 1
     st.session_state.is_complete = is_complete
 
 
 def render_playing():
-    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+    mode = st.session_state.get("color_mode", "dark")
+    st.markdown(get_css(mode), unsafe_allow_html=True)
     config = st.session_state.config
 
     # Header
@@ -708,8 +933,14 @@ def make_choice(text: str):
     config = st.session_state.config
     st.session_state.segments.append({"narrator": "user", "text": text, "choices": None, "ts": datetime.now().isoformat()})
 
-    with st.spinner("The story continues..."):
-        narrative, choices, is_complete = call_azure(config, st.session_state.segments, user_input=text, action="continue")
+    slot = st.empty()
+    try:
+        narrative, choices, is_complete = _stream_response(
+            slot, config, st.session_state.segments, user_input=text, action="continue"
+        )
+    except Exception as e:
+        st.session_state.error = f"Azure OpenAI error while continuing the story: {type(e).__name__}: {e}"
+        return
 
     st.session_state.segments.append({"narrator": "ai", "text": narrative, "choices": choices, "ts": datetime.now().isoformat()})
     st.session_state.turn_count += 1
@@ -820,12 +1051,31 @@ def main():
         page_title="Story Weaver — Interactive AI Storytelling",
         page_icon="📖",
         layout="centered",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="auto",
     )
     init_state()
 
+    # Sidebar: display mode toggle
+    with st.sidebar:
+        st.markdown("### 🖥️ Display Mode")
+        picked = st.radio(
+            "mode",
+            ["Dark", "Light", "System"],
+            index=["dark", "light", "system"].index(st.session_state.get("color_mode", "dark")),
+            label_visibility="collapsed",
+            horizontal=True,
+        )
+        if picked.lower() != st.session_state.get("color_mode", "dark"):
+            st.session_state.color_mode = picked.lower()
+            st.rerun()
+
+    if st.session_state.get("error"):
+        st.error(st.session_state.error)
+
     if not AZURE_KEY or not AZURE_ENDPOINT:
-        st.error("Azure OpenAI credentials not configured. Add AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT to `.streamlit/secrets.toml`.")
+        st.error(
+            "Azure OpenAI credentials not configured. Set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT in Streamlit secrets (or as environment variables)."
+        )
         st.stop()
 
     phase = st.session_state.phase
@@ -833,6 +1083,8 @@ def main():
         render_welcome()
     elif phase == "setup":
         render_setup()
+    elif phase == "ai_setup":
+        render_ai_setup()
     elif phase == "playing":
         render_playing()
 
